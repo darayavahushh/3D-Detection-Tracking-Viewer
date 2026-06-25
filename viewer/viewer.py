@@ -25,14 +25,17 @@ class Viewer:
         self.bev_trajectories = {}
         self.ego_pose = None
 
-        # BEV is drawn as a 2D inset INSIDE the vedo 3D window (single VTK event
-        # loop) so it never freezes the way a separate opencv window would while
-        # show_3D blocks waiting for a key press
+        # BEV is drawn in its OWN dedicated vtk window (NOT opencv). A second vtk
+        # window shares the main window's event pump on the same thread, so it
+        # stays responsive while show_3D blocks for a key press (an opencv window
+        # would freeze instead)
         self._bev_overlay_image = None   # latest BEV image (BGR uint8)
-        self._bev_actor = None           # vtkActor2D drawing the inset
+        self._bev_actor = None           # vtkActor2D drawing the BEV image
         self._bev_mapper = None
         self._bev_vtk_image = None
-        self.bev_inset_width = 360       # rendered inset width in pixels
+        self._bev_renderer = None
+        self._bev_render_window = None   # the separate BEV window
+        self.bev_window_name = "BEV"
 
         # data for rendering in 2D scene
         self.cam_intrinsic_mat = None
@@ -411,12 +414,12 @@ class Viewer:
         """
         self.ego_pose = None if pose is None else np.array(pose)
 
-    def _update_bev_overlay(self):
+    def _render_bev_window(self):
         """
-        (re)build the BEV inset as a vtk 2D overlay actor and make sure it is
-        attached to the current renderer, so it is drawn on top of the 3D scene
-        in the same window. Using a 2D actor keeps everything inside VTK's event
-        loop, so the BEV never freezes while show_3D blocks for a key press.
+        draw the latest BEV image (set by show_BEV) into its own separate vtk
+        window. A second vtk render window on the same thread keeps repainting
+        while the main 3D interactor blocks for a key press, so unlike an opencv
+        window it does not freeze.
         """
         if self._bev_overlay_image is None:
             return
@@ -426,11 +429,8 @@ class Viewer:
         h0, w0 = img_bgr.shape[:2]
         if w0 == 0 or h0 == 0:
             return
-        target_w = int(self.bev_inset_width)
-        target_h = max(1, int(round(h0 * target_w / float(w0))))
-        resized = cv2.resize(img_bgr, (target_w, target_h), interpolation=cv2.INTER_AREA)
         # BGR -> RGB and flip vertically (vtk image origin is bottom-left)
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         rgb = np.ascontiguousarray(np.flipud(rgb))
         h, w = rgb.shape[:2]
 
@@ -441,20 +441,20 @@ class Viewer:
         vtk_img.GetPointData().SetScalars(vtk_arr)
         self._bev_vtk_image = vtk_img
 
-        if self._bev_actor is None:
+        if self._bev_render_window is None:
             self._bev_mapper = vtk.vtkImageMapper()
             self._bev_mapper.SetColorWindow(255)
             self._bev_mapper.SetColorLevel(127.5)
             self._bev_actor = vtk.vtkActor2D()
             self._bev_actor.SetMapper(self._bev_mapper)
-            # anchor the inset to the bottom-left corner of the window
-            self._bev_actor.GetPositionCoordinate().SetCoordinateSystemToNormalizedViewport()
-            self._bev_actor.SetPosition(0.005, 0.005)
+            self._bev_renderer = vtk.vtkRenderer()
+            self._bev_renderer.AddActor2D(self._bev_actor)
+            self._bev_render_window = vtk.vtkRenderWindow()
+            self._bev_render_window.AddRenderer(self._bev_renderer)
+            self._bev_render_window.SetWindowName(self.bev_window_name)
         self._bev_mapper.SetInputData(self._bev_vtk_image)
-
-        ren = self.vi.renderer
-        ren.RemoveActor2D(self._bev_actor)  # no-op if not currently attached
-        ren.AddActor2D(self._bev_actor)
+        self._bev_render_window.SetSize(w, h)
+        self._bev_render_window.Render()
 
     def show_3D(self):
         """
@@ -463,8 +463,8 @@ class Viewer:
         :return:
         """
 
-        # draw the BEV as a 2D inset in this same window (set by show_BEV)
-        self._update_bev_overlay()
+        # draw the BEV in its own separate window (image set by show_BEV)
+        self._render_bev_window()
 
         if self.first_show:
             self.vi.show(self.actors+self.actors_without_del, resetcam=False,  camera={'pos': (-10, 0, 5), 'focalPoint': (5, 0, 2), 'viewup': (0, 0, 1)})#
