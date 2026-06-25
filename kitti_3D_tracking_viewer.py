@@ -25,6 +25,8 @@ def kitti_viewer():
         vi.set_extrinsic_mat(V2C)
         vi.set_intrinsic_mat(P2)
 
+        vi.show_BEV()
+
         vi.show_2D()
 
         vi.show_3D()

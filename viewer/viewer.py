@@ -20,6 +20,9 @@ class Viewer:
         self.actors_without_del = []
         self.tracks_actors_dict = {}
 
+        # per-object center history for the BEV tracking trails, id -> list of (x,y)
+        self.bev_trajectories = {}
+
         # data for rendering in 2D scene
         self.cam_intrinsic_mat = None
         self.cam_extrinsic_mat = None
@@ -509,4 +512,181 @@ class Viewer:
         cv2.waitKey(10)
         self.points_info.clear()
         self.boxes_info.clear()
+
+    def reset_bev_trajectories(self):
+        """
+        clear the cached BEV tracking trails (e.g. when starting a new sequence)
+        :return:
+        """
+        self.bev_trajectories.clear()
+
+    def show_BEV(self,
+                 scale=10,
+                 x_range=(0, 70),
+                 y_range=(-40, 40),
+                 bg_color=(10, 10, 10),
+                 point_color=(120, 120, 120),
+                 point_radius=1,
+                 box_line_width=2,
+                 default_box_color=(0, 255, 0),
+                 show_heading=True,
+                 show_ids=True,
+                 show_trajectory=True,
+                 trajectory_length=30,
+                 trajectory_line_width=2,
+                 trajectory_point_radius=2,
+                 grid_spacing=10,
+                 window_name="BEV"):
+        """
+        show a Bird's Eye View (top-down) of the current scene, including the
+        point cloud, the 3D box footprints and a per-object tracking trail that
+        is drawn from the box center using the same color as the box.
+
+        This method reads the cached ``boxes_info`` and ``points_info`` and does
+        not clear them, so it must be called BEFORE ``show_2D()`` / ``show_3D()``
+        (those methods clear the cache after rendering).
+
+        :param scale: (float), pixels per meter
+        :param x_range: (tuple(2,)), forward range in meters (KITTI LiDAR x)
+        :param y_range: (tuple(2,)), lateral range in meters (KITTI LiDAR y, left positive)
+        :param bg_color: (tuple(3,)), BEV background color in BGR
+        :param point_color: (tuple(3,)), point cloud color in BGR
+        :param point_radius: (int), radius of rendered points
+        :param box_line_width: (int), box outline width
+        :param default_box_color: (tuple(3,)), fallback box color in BGR when no ids/colors
+        :param show_heading: (bool), draw a heading indicator for each box
+        :param show_ids: (bool), draw object ids
+        :param show_trajectory: (bool), draw per-id tracking trails
+        :param trajectory_length: (int), max number of historical centers kept per id
+        :param trajectory_line_width: (int), trail line width
+        :param trajectory_point_radius: (int), radius of trail history markers
+        :param grid_spacing: (float), spacing of reference grid lines in meters, <=0 to disable
+        :param window_name: (str), name of the opencv window
+        :return: (array(H,W,3)), the rendered BEV image
+        """
+        x_min, x_max = x_range
+        y_min, y_max = y_range
+
+        width = int(round((y_max - y_min) * scale))
+        height = int(round((x_max - x_min) * scale))
+
+        bev_image = np.zeros((height, width, 3), dtype=np.uint8)
+        bev_image[:] = bg_color
+
+        def world_to_bev(wx, wy):
+            u = int(round((y_max - wy) * scale))
+            v = int(round((x_max - wx) * scale))
+            return u, v
+
+        # reference grid
+        if grid_spacing and grid_spacing > 0:
+            grid_color = tuple(int(min(255, c + 35)) for c in bg_color)
+            gx = x_min - (x_min % grid_spacing)
+            while gx <= x_max:
+                _, v = world_to_bev(gx, 0)
+                cv2.line(bev_image, (0, v), (width - 1, v), grid_color, 1)
+                gx += grid_spacing
+            gy = y_min - (y_min % grid_spacing)
+            while gy <= y_max:
+                u, _ = world_to_bev(0, gy)
+                cv2.line(bev_image, (u, 0), (u, height - 1), grid_color, 1)
+                gy += grid_spacing
+
+        # point cloud
+        for points, _ in self.points_info:
+            if points is None or len(points) == 0:
+                continue
+            pts = np.asarray(points)
+            px, py = pts[:, 0], pts[:, 1]
+            mask = (px >= x_min) & (px <= x_max) & (py >= y_min) & (py <= y_max)
+            px, py = px[mask], py[mask]
+            if len(px) == 0:
+                continue
+            us = np.round((y_max - py) * scale).astype(int)
+            vs = np.round((x_max - px) * scale).astype(int)
+            valid = (us >= 0) & (us < width) & (vs >= 0) & (vs < height)
+            us, vs = us[valid], vs[valid]
+            if point_radius <= 1:
+                bev_image[vs, us] = point_color
+            else:
+                for u, v in zip(us, vs):
+                    cv2.circle(bev_image, (int(u), int(v)), point_radius, point_color, -1)
+
+        # ego vehicle marker at the origin
+        cv2.drawMarker(bev_image, world_to_bev(0, 0), (0, 0, 255),
+                       markerType=cv2.MARKER_TRIANGLE_UP, markerSize=12, thickness=2)
+
+        # first pass: update trajectories and collect the current frame id -> color
+        current_id_color = {}
+        for boxes, ids, colors, _ in self.boxes_info:
+            if boxes is None or len(boxes) == 0:
+                continue
+            for i in range(len(boxes)):
+                if isinstance(colors, str):
+                    color_bgr = default_box_color
+                else:
+                    c = colors[i]
+                    color_bgr = (int(c[2]), int(c[1]), int(c[0]))
+
+                if ids is not None:
+                    ob_id = int(ids[i])
+                    current_id_color[ob_id] = color_bgr
+                    if show_trajectory:
+                        traj = self.bev_trajectories.setdefault(ob_id, [])
+                        traj.append((float(boxes[i][0]), float(boxes[i][1])))
+                        if len(traj) > trajectory_length:
+                            del traj[:len(traj) - trajectory_length]
+
+        # draw trajectories (only for objects present in the current frame)
+        if show_trajectory:
+            for ob_id, color_bgr in current_id_color.items():
+                traj = self.bev_trajectories.get(ob_id, [])
+                if len(traj) < 2:
+                    continue
+                pts = np.array([world_to_bev(wx, wy) for wx, wy in traj], dtype=np.int32)
+                cv2.polylines(bev_image, [pts], isClosed=False, color=color_bgr,
+                              thickness=trajectory_line_width)
+                for p in pts:
+                    cv2.circle(bev_image, (int(p[0]), int(p[1])), trajectory_point_radius,
+                               color_bgr, -1)
+
+        # second pass: draw box footprints on top of the trails
+        for boxes, ids, colors, _ in self.boxes_info:
+            if boxes is None or len(boxes) == 0:
+                continue
+            for i in range(len(boxes)):
+                box = boxes[i]
+                cx, cy = box[0], box[1]
+                l, w, yaw = box[3], box[4], box[6]
+
+                if isinstance(colors, str):
+                    color_bgr = default_box_color
+                else:
+                    c = colors[i]
+                    color_bgr = (int(c[2]), int(c[1]), int(c[0]))
+
+                cos_y, sin_y = np.cos(yaw), np.sin(yaw)
+                rot = np.array([[cos_y, -sin_y], [sin_y, cos_y]])
+                local = np.array([[l / 2, w / 2],
+                                  [l / 2, -w / 2],
+                                  [-l / 2, -w / 2],
+                                  [-l / 2, w / 2]])
+                world = local @ rot.T + np.array([cx, cy])
+                poly = np.array([world_to_bev(wx, wy) for wx, wy in world], dtype=np.int32)
+                cv2.polylines(bev_image, [poly], isClosed=True, color=color_bgr,
+                              thickness=box_line_width)
+
+                if show_heading:
+                    front = np.array([l / 2, 0.0]) @ rot.T + np.array([cx, cy])
+                    cv2.line(bev_image, world_to_bev(cx, cy),
+                             world_to_bev(front[0], front[1]), color_bgr, box_line_width)
+
+                if show_ids and ids is not None:
+                    u, v = world_to_bev(cx, cy)
+                    cv2.putText(bev_image, str(int(ids[i])), (u + 5, v - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, color_bgr, 1, cv2.LINE_AA)
+
+        cv2.imshow(window_name, bev_image)
+        cv2.waitKey(10)
+        return bev_image
 
