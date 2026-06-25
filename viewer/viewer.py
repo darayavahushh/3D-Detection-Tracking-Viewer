@@ -25,6 +25,15 @@ class Viewer:
         self.bev_trajectories = {}
         self.ego_pose = None
 
+        # BEV is drawn as a 2D inset INSIDE the vedo 3D window (single VTK event
+        # loop) so it never freezes the way a separate opencv window would while
+        # show_3D blocks waiting for a key press
+        self._bev_overlay_image = None   # latest BEV image (BGR uint8)
+        self._bev_actor = None           # vtkActor2D drawing the inset
+        self._bev_mapper = None
+        self._bev_vtk_image = None
+        self.bev_inset_width = 360       # rendered inset width in pixels
+
         # data for rendering in 2D scene
         self.cam_intrinsic_mat = None
         self.cam_extrinsic_mat = None
@@ -402,12 +411,60 @@ class Viewer:
         """
         self.ego_pose = None if pose is None else np.array(pose)
 
+    def _update_bev_overlay(self):
+        """
+        (re)build the BEV inset as a vtk 2D overlay actor and make sure it is
+        attached to the current renderer, so it is drawn on top of the 3D scene
+        in the same window. Using a 2D actor keeps everything inside VTK's event
+        loop, so the BEV never freezes while show_3D blocks for a key press.
+        """
+        if self._bev_overlay_image is None:
+            return
+        from vtk.util.numpy_support import numpy_to_vtk
+
+        img_bgr = self._bev_overlay_image
+        h0, w0 = img_bgr.shape[:2]
+        if w0 == 0 or h0 == 0:
+            return
+        target_w = int(self.bev_inset_width)
+        target_h = max(1, int(round(h0 * target_w / float(w0))))
+        resized = cv2.resize(img_bgr, (target_w, target_h), interpolation=cv2.INTER_AREA)
+        # BGR -> RGB and flip vertically (vtk image origin is bottom-left)
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        rgb = np.ascontiguousarray(np.flipud(rgb))
+        h, w = rgb.shape[:2]
+
+        vtk_img = vtk.vtkImageData()
+        vtk_img.SetDimensions(w, h, 1)
+        vtk_arr = numpy_to_vtk(rgb.reshape(-1, 3), deep=1,
+                               array_type=vtk.VTK_UNSIGNED_CHAR)
+        vtk_img.GetPointData().SetScalars(vtk_arr)
+        self._bev_vtk_image = vtk_img
+
+        if self._bev_actor is None:
+            self._bev_mapper = vtk.vtkImageMapper()
+            self._bev_mapper.SetColorWindow(255)
+            self._bev_mapper.SetColorLevel(127.5)
+            self._bev_actor = vtk.vtkActor2D()
+            self._bev_actor.SetMapper(self._bev_mapper)
+            # anchor the inset to the bottom-left corner of the window
+            self._bev_actor.GetPositionCoordinate().SetCoordinateSystemToNormalizedViewport()
+            self._bev_actor.SetPosition(0.005, 0.005)
+        self._bev_mapper.SetInputData(self._bev_vtk_image)
+
+        ren = self.vi.renderer
+        ren.RemoveActor2D(self._bev_actor)  # no-op if not currently attached
+        ren.AddActor2D(self._bev_actor)
+
     def show_3D(self):
         """
         show objects in 3D scenes, before show_3D, you should add some objects into the current scenes
         :param bg_color: (tuple(3,) or list(3,) or str), background color of 3D scene
         :return:
         """
+
+        # draw the BEV as a 2D inset in this same window (set by show_BEV)
+        self._update_bev_overlay()
 
         if self.first_show:
             self.vi.show(self.actors+self.actors_without_del, resetcam=False,  camera={'pos': (-10, 0, 5), 'focalPoint': (5, 0, 2), 'viewup': (0, 0, 1)})#
@@ -574,7 +631,7 @@ class Viewer:
         :param trajectory_line_width: (int), trail line width
         :param trajectory_point_radius: (int), radius of trail history markers
         :param grid_spacing: (float), spacing of reference grid lines in meters, <=0 to disable
-        :param window_name: (str), name of the opencv window
+        :param window_name: (str), kept for backward compatibility, unused (BEV is now an inset)
         :return: (array(H,W,3)), the rendered BEV image
         """
         x_min, x_max = x_range
@@ -713,7 +770,8 @@ class Viewer:
                     cv2.putText(bev_image, str(int(ids[i])), (u + 5, v - 5),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, color_bgr, 1, cv2.LINE_AA)
 
-        cv2.imshow(window_name, bev_image)
-        cv2.waitKey(10)
+        # store for display as an inset inside the vedo 3D window (drawn by
+        # show_3D); no separate opencv window, so it never starves / freezes
+        self._bev_overlay_image = bev_image
         return bev_image
 
