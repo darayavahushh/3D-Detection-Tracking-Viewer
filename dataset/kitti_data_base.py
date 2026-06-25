@@ -141,6 +141,74 @@ def read_tracking_label(path):
 
     return frame_dict,names_dict
 
+
+def read_imu_to_velo(calib_path):
+    """
+    read the imu(GPS/IMU) -> velodyne transform (Tr_imu_velo) from a kitti
+    tracking calib file.
+    input: calib txt path
+    output: (4,4) matrix mapping a point in the imu frame to the velodyne frame,
+            or None if the entry is not present
+    """
+    with open(calib_path) as f:
+        for line in f.readlines():
+            if line[:14] == "Tr_imu_to_velo" or line[:11] == "Tr_imu_velo":
+                mat = re.split(" ", line.strip())
+                mat = np.array(mat[-12:], np.float32).reshape((3, 4))
+                mat = np.concatenate([mat, [[0, 0, 0, 1]]])
+                return mat
+    return None
+
+
+def load_oxts_poses(oxts_path):
+    """
+    read a kitti oxts (GPS/IMU) file and convert each packet to a 4x4 pose
+    matrix that maps a point in the imu frame at that frame into a fixed world
+    frame (the first frame is used as the origin).
+    input: oxts txt path
+    output: list of (4,4) numpy arrays, one per frame (T_world_imu)
+    """
+    poses = []
+    scale = None
+    origin_inv = None
+    earth_radius = 6378137.0  # in meters, WGS-84
+
+    with open(oxts_path) as f:
+        for line in f.readlines():
+            vals = line.strip().split()
+            if len(vals) < 6:
+                continue
+            lat, lon, alt = float(vals[0]), float(vals[1]), float(vals[2])
+            roll, pitch, yaw = float(vals[3]), float(vals[4]), float(vals[5])
+
+            if scale is None:
+                scale = np.cos(lat * np.pi / 180.0)
+
+            # mercator projection of the GPS coordinates
+            tx = scale * lon * np.pi * earth_radius / 180.0
+            ty = scale * earth_radius * np.log(np.tan((90.0 + lat) * np.pi / 360.0))
+            tz = alt
+
+            Rx = np.array([[1, 0, 0],
+                           [0, np.cos(roll), -np.sin(roll)],
+                           [0, np.sin(roll), np.cos(roll)]])
+            Ry = np.array([[np.cos(pitch), 0, np.sin(pitch)],
+                           [0, 1, 0],
+                           [-np.sin(pitch), 0, np.cos(pitch)]])
+            Rz = np.array([[np.cos(yaw), -np.sin(yaw), 0],
+                           [np.sin(yaw), np.cos(yaw), 0],
+                           [0, 0, 1]])
+            T = np.eye(4)
+            T[:3, :3] = Rz @ Ry @ Rx
+            T[:3, 3] = [tx, ty, tz]
+
+            if origin_inv is None:
+                origin_inv = np.linalg.inv(T)
+            poses.append(origin_inv @ T)
+
+    return poses
+
+
 if __name__ == '__main__':
     path = 'H:/dataset/traking/training/label_02/0000.txt'
     labels,a = read_tracking_label(path)

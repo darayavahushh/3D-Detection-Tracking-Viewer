@@ -12,6 +12,7 @@ def kitti_viewer():
     for i in range(len(dataset)):
         P2, V2C, points, image, labels, label_names = dataset[i]
 
+        ego_pose = dataset.poses[i] if dataset.poses is not None else None
 
         if labels is not None:
             mask = (label_names=="Car")
@@ -24,6 +25,7 @@ def kitti_viewer():
         vi.add_image(image)
         vi.set_extrinsic_mat(V2C)
         vi.set_intrinsic_mat(P2)
+        vi.set_ego_pose(ego_pose)
 
         vi.show_BEV()
 

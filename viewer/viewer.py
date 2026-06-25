@@ -20,8 +20,14 @@ class Viewer:
         self.actors_without_del = []
         self.tracks_actors_dict = {}
 
-        # per-object center history for the BEV tracking trails, id -> list of (x,y)
+        # per-object center history for the BEV tracking trails, id -> list of
+        # (x,y,z) world-frame centers, and the current ego pose used to map them
         self.bev_trajectories = {}
+        self.ego_pose = None
+
+        # whether the timer that keeps the opencv windows (BEV / 2D image) alive
+        # while the blocking vtk 3D interactor is running has been installed
+        self._cv2_pump_installed = False
 
         # data for rendering in 2D scene
         self.cam_intrinsic_mat = None
@@ -389,12 +395,59 @@ class Viewer:
         self.image = im
         return
 
+    def set_ego_pose(self, pose):
+        """
+        set the ego vehicle pose for the current frame, used to draw the BEV
+        tracking trails in a fixed world frame (so a static object leaves no
+        trail and only real object motion is tracked).
+        :param pose: (array(4,4) or None), transform mapping a point in the
+                     current velodyne/ego frame into a fixed world frame
+        :return:
+        """
+        self.ego_pose = None if pose is None else np.array(pose)
+
+    def _pump_cv2(self, *args):
+        """
+        process pending opencv highgui events; used as a vtk timer callback so
+        the BEV / 2D image windows keep repainting (and stay screenshot-able)
+        while the 3D interactor blocks waiting for a key press
+        """
+        try:
+            cv2.waitKey(1)
+        except Exception:
+            pass
+
+    def _ensure_cv2_pump(self):
+        """
+        install a repeating vtk timer on the 3D interactor that periodically
+        pumps the opencv event loop. Without this the opencv windows freeze
+        ("Not Responding") while ``show_3D`` blocks, so the BEV could not be
+        viewed / captured between key presses.
+        """
+        if self._cv2_pump_installed:
+            return
+        iren = getattr(self.vi, "interactor", None)
+        if iren is None:
+            return
+        try:
+            iren.AddObserver("TimerEvent", self._pump_cv2)
+            if hasattr(iren, "GetInitialized") and not iren.GetInitialized():
+                iren.Initialize()
+            iren.CreateRepeatingTimer(30)
+            self._cv2_pump_installed = True
+        except Exception:
+            # keep the viewer usable even if the timer cannot be created
+            self._cv2_pump_installed = True
+
     def show_3D(self):
         """
         show objects in 3D scenes, before show_3D, you should add some objects into the current scenes
         :param bg_color: (tuple(3,) or list(3,) or str), background color of 3D scene
         :return:
         """
+
+        # keep the opencv BEV / image windows responsive while the interactor blocks
+        self._ensure_cv2_pump()
 
         if self.first_show:
             self.vi.show(self.actors+self.actors_without_del, resetcam=False,  camera={'pos': (-10, 0, 5), 'focalPoint': (5, 0, 2), 'viewup': (0, 0, 1)})#
@@ -573,6 +626,13 @@ class Viewer:
         bev_image = np.zeros((height, width, 3), dtype=np.uint8)
         bev_image[:] = bg_color
 
+        # ego pose for the current frame; trails are accumulated in this world
+        # frame and mapped back to the current ego frame for drawing, so a
+        # static object (fixed in the world) collapses to a point and draws no
+        # line, while a moving object leaves a real trail
+        pose = self.ego_pose if self.ego_pose is not None else np.eye(4)
+        inv_pose = np.linalg.inv(pose)
+
         def world_to_bev(wx, wy):
             u = int(round((y_max - wy) * scale))
             v = int(round((x_max - wx) * scale))
@@ -633,7 +693,9 @@ class Viewer:
                     current_id_color[ob_id] = color_bgr
                     if show_trajectory:
                         traj = self.bev_trajectories.setdefault(ob_id, [])
-                        traj.append((float(boxes[i][0]), float(boxes[i][1])))
+                        center = np.array([boxes[i][0], boxes[i][1], boxes[i][2], 1.0])
+                        world_center = pose @ center
+                        traj.append((world_center[0], world_center[1], world_center[2]))
                         if len(traj) > trajectory_length:
                             del traj[:len(traj) - trajectory_length]
 
@@ -643,7 +705,12 @@ class Viewer:
                 traj = self.bev_trajectories.get(ob_id, [])
                 if len(traj) < 2:
                     continue
-                pts = np.array([world_to_bev(wx, wy) for wx, wy in traj], dtype=np.int32)
+                # map the stored world-frame centers back into the current ego frame
+                cur_centers = inv_pose @ np.array(
+                    [[wx, wy, wz, 1.0] for wx, wy, wz in traj]).T
+                cur_centers = cur_centers.T
+                pts = np.array([world_to_bev(c[0], c[1]) for c in cur_centers],
+                               dtype=np.int32)
                 cv2.polylines(bev_image, [pts], isClosed=False, color=color_bgr,
                               thickness=trajectory_line_width)
                 for p in pts:

@@ -56,6 +56,18 @@ class KittiTrackingDataset:
         self.P2, self.V2C = read_calib(calib_path)
         self.labels, self.label_names = read_tracking_label(label_path)
 
+        # per-frame ego pose (velodyne frame at frame t -> fixed world frame),
+        # used to draw object trajectories in world coordinates. Requires the
+        # KITTI oxts(GPS/IMU) data; stays None when it is not available.
+        self.poses = None
+        oxts_path = os.path.join(self.root_path, "oxts", self.seq_name + '.txt')
+        imu_to_velo = read_imu_to_velo(calib_path)
+        if os.path.exists(oxts_path) and imu_to_velo is not None:
+            imu_poses = load_oxts_poses(oxts_path)          # T_world_imu
+            velo_to_imu = np.linalg.inv(imu_to_velo)         # velodyne -> imu
+            self.poses = [p @ velo_to_imu for p in imu_poses]  # T_world_velo
+
+
     def __len__(self):
         return len(self.all_ids)-1
     def __getitem__(self, item):
