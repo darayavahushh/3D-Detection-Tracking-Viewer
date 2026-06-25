@@ -25,16 +25,6 @@ class Viewer:
         self.bev_trajectories = {}
         self.ego_pose = None
 
-        # BEV is drawn in a side panel of the SAME vedo window (a second vtk
-        # renderer/viewport). One window + one interactor avoids the crash a
-        # truly separate window causes (second GL context/interactor), and a
-        # side panel does not overlap / clutter the 3D scene.
-        self._bev_overlay_image = None   # latest BEV image (BGR uint8)
-        self._bev_actor = None           # vtkImageActor showing the BEV image
-        self._bev_vtk_image = None
-        self._bev_renderer = None        # side-panel renderer in the same window
-        self.bev_panel_fraction = 0.26   # fraction of window width used for BEV
-
         # data for rendering in 2D scene
         self.cam_intrinsic_mat = None
         self.cam_extrinsic_mat = None
@@ -412,54 +402,6 @@ class Viewer:
         """
         self.ego_pose = None if pose is None else np.array(pose)
 
-    def _render_bev_panel(self):
-        """
-        draw the latest BEV image (set by show_BEV) into a side panel of the
-        SAME vedo window, using a second vtk renderer/viewport. Keeping a single
-        window + single interactor avoids the crash a truly separate OS window
-        causes (a second GL context/interactor), so the BEV never freezes and it
-        does not overlap / clutter the 3D scene.
-        """
-        if self._bev_overlay_image is None:
-            return
-        from vtk.util.numpy_support import numpy_to_vtk
-
-        img_bgr = self._bev_overlay_image
-        h0, w0 = img_bgr.shape[:2]
-        if w0 == 0 or h0 == 0:
-            return
-        # BGR -> RGB and flip vertically (vtk image origin is bottom-left)
-        rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        rgb = np.ascontiguousarray(np.flipud(rgb))
-        h, w = rgb.shape[:2]
-
-        vtk_img = vtk.vtkImageData()
-        vtk_img.SetDimensions(w, h, 1)
-        vtk_arr = numpy_to_vtk(rgb.reshape(-1, 3), deep=1,
-                               array_type=vtk.VTK_UNSIGNED_CHAR)
-        vtk_img.GetPointData().SetScalars(vtk_arr)
-        self._bev_vtk_image = vtk_img
-
-        split = 1.0 - float(self.bev_panel_fraction)
-        if self._bev_renderer is None:
-            win = getattr(self.vi, "window", None)
-            if win is None:
-                win = self.vi.renderer.GetRenderWindow()
-            if win is None:
-                return
-            self._bev_actor = vtk.vtkImageActor()
-            self._bev_renderer = vtk.vtkRenderer()
-            self._bev_renderer.SetViewport(split, 0.0, 1.0, 1.0)
-            self._bev_renderer.SetBackground(0.05, 0.05, 0.05)
-            self._bev_renderer.InteractiveOff()
-            self._bev_renderer.AddActor(self._bev_actor)
-            self._bev_renderer.GetActiveCamera().ParallelProjectionOn()
-            win.AddRenderer(self._bev_renderer)
-        # keep the 3D scene on the left part of the window
-        self.vi.renderer.SetViewport(0.0, 0.0, split, 1.0)
-        self._bev_actor.SetInputData(self._bev_vtk_image)
-        self._bev_renderer.ResetCamera()
-
     def show_3D(self):
         """
         show objects in 3D scenes, before show_3D, you should add some objects into the current scenes
@@ -467,15 +409,29 @@ class Viewer:
         :return:
         """
 
-        # draw the BEV in a side panel of the same window (image set by show_BEV)
-        self._render_bev_panel()
-
+        # render the 3D scene WITHOUT blocking. vedo's blocking interactor starves
+        # the opencv windows (BEV / 2D) and crashes them, so instead the BEV
+        # opencv window owns the wait: a key press there advances the frame.
         if self.first_show:
-            self.vi.show(self.actors+self.actors_without_del, resetcam=False,  camera={'pos': (-10, 0, 5), 'focalPoint': (5, 0, 2), 'viewup': (0, 0, 1)})#
+            self.vi.show(self.actors + self.actors_without_del, resetcam=False,
+                         interactive=False,
+                         camera={'pos': (-10, 0, 5), 'focalPoint': (5, 0, 2), 'viewup': (0, 0, 1)})
             self.first_show = False
         else:
-            self.vi.show(self.actors + self.actors_without_del, resetcam=False)
-            
+            self.vi.show(self.actors + self.actors_without_del, resetcam=False,
+                         interactive=False)
+
+        # block until a key is pressed in one of the opencv windows (BEV / 2D),
+        # keeping the 3D window repainted so it does not go stale
+        while True:
+            key = cv2.waitKey(30)
+            try:
+                self.vi.render()
+            except Exception:
+                pass
+            if key != -1:
+                break
+
         self.vi.clear()
         self.actors.clear()
         self.points_info.clear()
@@ -774,8 +730,10 @@ class Viewer:
                     cv2.putText(bev_image, str(int(ids[i])), (u + 5, v - 5),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, color_bgr, 1, cv2.LINE_AA)
 
-        # store for display as an inset inside the vedo 3D window (drawn by
-        # show_3D); no separate opencv window, so it never starves / freezes
-        self._bev_overlay_image = bev_image
+        # the BEV is its own opencv window and is the control window: a key press
+        # here (or in the 2D window) advances to the next frame (handled by the
+        # non-blocking show_3D wait loop)
+        cv2.imshow(window_name, bev_image)
+        cv2.waitKey(1)
         return bev_image
 
