@@ -25,17 +25,15 @@ class Viewer:
         self.bev_trajectories = {}
         self.ego_pose = None
 
-        # BEV is drawn in its OWN dedicated vtk window (NOT opencv). A second vtk
-        # window shares the main window's event pump on the same thread, so it
-        # stays responsive while show_3D blocks for a key press (an opencv window
-        # would freeze instead)
+        # BEV is drawn in a side panel of the SAME vedo window (a second vtk
+        # renderer/viewport). One window + one interactor avoids the crash a
+        # truly separate window causes (second GL context/interactor), and a
+        # side panel does not overlap / clutter the 3D scene.
         self._bev_overlay_image = None   # latest BEV image (BGR uint8)
-        self._bev_actor = None           # vtkActor2D drawing the BEV image
-        self._bev_mapper = None
+        self._bev_actor = None           # vtkImageActor showing the BEV image
         self._bev_vtk_image = None
-        self._bev_renderer = None
-        self._bev_render_window = None   # the separate BEV window
-        self.bev_window_name = "BEV"
+        self._bev_renderer = None        # side-panel renderer in the same window
+        self.bev_panel_fraction = 0.26   # fraction of window width used for BEV
 
         # data for rendering in 2D scene
         self.cam_intrinsic_mat = None
@@ -414,12 +412,13 @@ class Viewer:
         """
         self.ego_pose = None if pose is None else np.array(pose)
 
-    def _render_bev_window(self):
+    def _render_bev_panel(self):
         """
-        draw the latest BEV image (set by show_BEV) into its own separate vtk
-        window. A second vtk render window on the same thread keeps repainting
-        while the main 3D interactor blocks for a key press, so unlike an opencv
-        window it does not freeze.
+        draw the latest BEV image (set by show_BEV) into a side panel of the
+        SAME vedo window, using a second vtk renderer/viewport. Keeping a single
+        window + single interactor avoids the crash a truly separate OS window
+        causes (a second GL context/interactor), so the BEV never freezes and it
+        does not overlap / clutter the 3D scene.
         """
         if self._bev_overlay_image is None:
             return
@@ -441,20 +440,25 @@ class Viewer:
         vtk_img.GetPointData().SetScalars(vtk_arr)
         self._bev_vtk_image = vtk_img
 
-        if self._bev_render_window is None:
-            self._bev_mapper = vtk.vtkImageMapper()
-            self._bev_mapper.SetColorWindow(255)
-            self._bev_mapper.SetColorLevel(127.5)
-            self._bev_actor = vtk.vtkActor2D()
-            self._bev_actor.SetMapper(self._bev_mapper)
+        split = 1.0 - float(self.bev_panel_fraction)
+        if self._bev_renderer is None:
+            win = getattr(self.vi, "window", None)
+            if win is None:
+                win = self.vi.renderer.GetRenderWindow()
+            if win is None:
+                return
+            self._bev_actor = vtk.vtkImageActor()
             self._bev_renderer = vtk.vtkRenderer()
-            self._bev_renderer.AddActor2D(self._bev_actor)
-            self._bev_render_window = vtk.vtkRenderWindow()
-            self._bev_render_window.AddRenderer(self._bev_renderer)
-            self._bev_render_window.SetWindowName(self.bev_window_name)
-        self._bev_mapper.SetInputData(self._bev_vtk_image)
-        self._bev_render_window.SetSize(w, h)
-        self._bev_render_window.Render()
+            self._bev_renderer.SetViewport(split, 0.0, 1.0, 1.0)
+            self._bev_renderer.SetBackground(0.05, 0.05, 0.05)
+            self._bev_renderer.InteractiveOff()
+            self._bev_renderer.AddActor(self._bev_actor)
+            self._bev_renderer.GetActiveCamera().ParallelProjectionOn()
+            win.AddRenderer(self._bev_renderer)
+        # keep the 3D scene on the left part of the window
+        self.vi.renderer.SetViewport(0.0, 0.0, split, 1.0)
+        self._bev_actor.SetInputData(self._bev_vtk_image)
+        self._bev_renderer.ResetCamera()
 
     def show_3D(self):
         """
@@ -463,8 +467,8 @@ class Viewer:
         :return:
         """
 
-        # draw the BEV in its own separate window (image set by show_BEV)
-        self._render_bev_window()
+        # draw the BEV in a side panel of the same window (image set by show_BEV)
+        self._render_bev_panel()
 
         if self.first_show:
             self.vi.show(self.actors+self.actors_without_del, resetcam=False,  camera={'pos': (-10, 0, 5), 'focalPoint': (5, 0, 2), 'viewup': (0, 0, 1)})#
