@@ -25,10 +25,6 @@ class Viewer:
         self.bev_trajectories = {}
         self.ego_pose = None
 
-        # whether the timer that keeps the opencv windows (BEV / 2D image) alive
-        # while the blocking vtk 3D interactor is running has been installed
-        self._cv2_pump_installed = False
-
         # data for rendering in 2D scene
         self.cam_intrinsic_mat = None
         self.cam_extrinsic_mat = None
@@ -406,48 +402,12 @@ class Viewer:
         """
         self.ego_pose = None if pose is None else np.array(pose)
 
-    def _pump_cv2(self, *args):
-        """
-        process pending opencv highgui events; used as a vtk timer callback so
-        the BEV / 2D image windows keep repainting (and stay screenshot-able)
-        while the 3D interactor blocks waiting for a key press
-        """
-        try:
-            cv2.waitKey(1)
-        except Exception:
-            pass
-
-    def _ensure_cv2_pump(self):
-        """
-        install a repeating vtk timer on the 3D interactor that periodically
-        pumps the opencv event loop. Without this the opencv windows freeze
-        ("Not Responding") while ``show_3D`` blocks, so the BEV could not be
-        viewed / captured between key presses.
-        """
-        if self._cv2_pump_installed:
-            return
-        iren = getattr(self.vi, "interactor", None)
-        if iren is None:
-            return
-        try:
-            iren.AddObserver("TimerEvent", self._pump_cv2)
-            if hasattr(iren, "GetInitialized") and not iren.GetInitialized():
-                iren.Initialize()
-            iren.CreateRepeatingTimer(30)
-            self._cv2_pump_installed = True
-        except Exception:
-            # keep the viewer usable even if the timer cannot be created
-            self._cv2_pump_installed = True
-
     def show_3D(self):
         """
         show objects in 3D scenes, before show_3D, you should add some objects into the current scenes
         :param bg_color: (tuple(3,) or list(3,) or str), background color of 3D scene
         :return:
         """
-
-        # keep the opencv BEV / image windows responsive while the interactor blocks
-        self._ensure_cv2_pump()
 
         if self.first_show:
             self.vi.show(self.actors+self.actors_without_del, resetcam=False,  camera={'pos': (-10, 0, 5), 'focalPoint': (5, 0, 2), 'viewup': (0, 0, 1)})#
